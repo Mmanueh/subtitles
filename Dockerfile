@@ -24,7 +24,7 @@ COPY runpod_handler.py .
 # === PRE-CARGA DEL MODELO QWEN3.5 ===
 RUN ollama serve & \
     sleep 12 && \
-    ollama pull qwen3.5:32b && \        # ← Cambia a qwen3.5:37b si existe
+    ollama pull qwen3.5:32b && \
     pkill ollama || true
 
 CMD ["python3", "-u", "runpod_handler.py"]
