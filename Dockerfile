@@ -5,7 +5,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     OLLAMA_HOST=127.0.0.1:11434 \
-    OLLAMA_MODELS=/runpod-volume/ollama
+    OLLAMA_MODELS=/runpod-volume/ollama \
+    OLLAMA_NUM_PARALLEL=4 \
+    OLLAMA_MAX_QUEUE=8
+    
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv curl ca-certificates \

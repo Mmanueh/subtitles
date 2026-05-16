@@ -1,11 +1,17 @@
 """
 Traduce y mejora un archivo de subtítulos (.srt) usando un modelo de Ollama
-(qwen2.5 por defecto).
+(qwen2.5 por defecto), enviando múltiples chunks EN PARALELO al servidor
+mediante asyncio + ollama.AsyncClient.
+
+Pensado para entornos serverless (RunPod) con GPU potente (RTX 6000 Ada):
+- Por defecto procesa `--concurrencia 8` chunks simultáneos.
+- IMPORTANTE: arranca el servidor de Ollama con `OLLAMA_NUM_PARALLEL=<N>`
+  igual o mayor que `--concurrencia`, o las peticiones se encolarán igual.
 
 Uso:
     python mejorar_subtitulos.py "ruta/al/subtitulos.srt"
     python mejorar_subtitulos.py "video.ja.srt" --idioma-origen Japanese --idioma-destino English
-    python mejorar_subtitulos.py "video.srt" --modelo qwen2.5:7b --chunk 20
+    python mejorar_subtitulos.py "video.srt" --modelo qwen2.5:7b --chunk 20 --concurrencia 8
     python mejorar_subtitulos.py "video.srt" --prompt-file mi_prompt.txt
 
 El archivo de salida se genera en la misma carpeta. Si la entrada es
@@ -13,6 +19,7 @@ El archivo de salida se genera en la misma carpeta. Si la entrada es
 """
 
 import argparse
+import asyncio
 import json
 import re
 import sys
@@ -31,7 +38,7 @@ import ollama
 # y evita que el LLM intente "traducir" う ぅ う ぅ う ぅ...
 
 _PUNTUACION_RE = re.compile(
-    r'[\s、。,.!?！？…ー〜・「」『』（）()【】\u3000]+'
+    r'[\s、。,.!?！？…ー〜・「」『』(\uff09()【】\u3000]+'
 )
 
 
@@ -86,7 +93,9 @@ For each line, create a greatly enhanced English version that:
 - Maintain PERFECT natural English grammar, conjugation and sentence structure.
 - Every line must be a complete, natural sounding English sentence or exclamation.
 - Do not use fragments or missing subjects.
-- Make the dialogue flow naturally as if a native English speaker is saying it in porn.
+- NEVER leave Japanese words untranslated.
+- Maintain PERFECT natural English grammar, conjugation and sentence flow.
+- Sound like high-quality native English JAV porn dialogue.
 
 CRITICAL RULES:
 - Be explicit and vulgar. Do not tone down or avoid sexual language.
@@ -289,22 +298,22 @@ def aplicar_post_procesado(
     return salida, n_envueltos, n_divididos
 
 
-# ---------------------- Ollama ----------------------
+# ---------------------- Ollama (async) ----------------------
 
 def hacer_chunks(lst: list, n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
 
-def procesar_chunk(
-    client: ollama.Client,
+async def procesar_chunk_async(
+    client: ollama.AsyncClient,
     chunk: list[Subtitulo],
     modelo: str,
     prompt_sistema: str,
     temperatura: float,
     num_ctx: int,
 ) -> dict[int, str]:
-    """Envía un chunk a Ollama y devuelve {indice: texto_traducido}."""
+    """Envía un chunk a Ollama (async) y devuelve {indice: texto_traducido}."""
     payload = {
         "lines": [{"index": s.indice, "text": s.texto} for s in chunk]
     }
@@ -314,7 +323,7 @@ def procesar_chunk(
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 
-    response = client.chat(
+    response = await client.chat(
         model=modelo,
         messages=[
             {"role": "system", "content": prompt_sistema},
@@ -325,6 +334,7 @@ def procesar_chunk(
             "num_ctx": num_ctx,
         },
         format="json",  # Fuerza salida JSON válida
+        keep_alive="30m",  # Mantiene el modelo en VRAM entre llamadas paralelas
     )
     content = response["message"]["content"]
     data = json.loads(content)
@@ -366,14 +376,10 @@ def _texto_es_idioma_incorrecto(texto: str, idioma_destino: str) -> bool:
     """
     destino = idioma_destino.strip().lower()
     if destino in _CJK_OK_TARGETS:
-        # Para destinos CJK no aplicamos esta detección (compleja distinguir
-        # chino vs japonés sin librerías extra).
         return False
     if destino not in _LATIN_SCRIPTS:
-        # Idioma desconocido para nosotros — no asumimos
         return False
 
-    # Contamos CJK Unified Ideographs + Hiragana + Katakana + Hangul
     cjk_count = 0
     total_letras = 0
     for c in texto:
@@ -381,15 +387,14 @@ def _texto_es_idioma_incorrecto(texto: str, idioma_destino: str) -> bool:
             continue
         total_letras += 1
         cp = ord(c)
-        if (0x4E00 <= cp <= 0x9FFF        # CJK Unified Ideographs (hanzi/kanji)
-                or 0x3040 <= cp <= 0x309F  # Hiragana
-                or 0x30A0 <= cp <= 0x30FF  # Katakana
-                or 0xAC00 <= cp <= 0xD7AF):  # Hangul
+        if (0x4E00 <= cp <= 0x9FFF
+                or 0x3040 <= cp <= 0x309F
+                or 0x30A0 <= cp <= 0x30FF
+                or 0xAC00 <= cp <= 0xD7AF):
             cjk_count += 1
 
     if total_letras < 3:
-        return False  # texto muy corto, no fiable
-    # Si más del 30% del texto es CJK siendo destino latino, está mal
+        return False
     return cjk_count / total_letras > 0.30
 
 
@@ -405,9 +410,116 @@ def _fraccion_idioma_incorrecto(
     return n / len(traducciones)
 
 
+# ---------------------- Worker async por chunk ----------------------
+
+async def procesar_chunk_con_reintentos(
+    n_chunk: int,
+    total_chunks: int,
+    chunk: list[Subtitulo],
+    client: ollama.AsyncClient,
+    modelo: str,
+    prompt_final: str,
+    idioma_destino: str,
+    temperatura: float,
+    num_ctx: int,
+    reintentos: int,
+    semaforo: asyncio.Semaphore,
+    estado: dict,
+) -> tuple[int, list[Subtitulo], int, bool]:
+    """
+    Procesa un chunk con su política de reintentos. Limitada por el semáforo
+    para no saturar al servidor más allá de la concurrencia configurada.
+
+    Devuelve: (n_chunk, lista_subtítulos_resultantes, fallidos, idioma_malo_final).
+    """
+    async with semaforo:
+        rango = f"{chunk[0].indice}-{chunk[-1].indice}"
+        traducciones: dict[int, str] = {}
+        intento = 0
+        idioma_malo_final = False
+        notas: list[str] = []
+
+        while intento <= reintentos:
+            try:
+                temp_intento = temperatura + 0.15 * intento
+                traducciones = await procesar_chunk_async(
+                    client=client,
+                    chunk=chunk,
+                    modelo=modelo,
+                    prompt_sistema=prompt_final,
+                    temperatura=temp_intento,
+                    num_ctx=num_ctx,
+                )
+                frac_mala = _fraccion_idioma_incorrecto(
+                    traducciones, idioma_destino
+                )
+                if frac_mala > 0.40:
+                    raise IdiomaIncorrectoError(
+                        f"{int(frac_mala*100)}% de las líneas en idioma incorrecto"
+                    )
+                break
+            except IdiomaIncorrectoError as e:
+                intento += 1
+                if intento > reintentos:
+                    notas.append(f"⚠️  idioma incorrecto ({e}), uso originales")
+                    idioma_malo_final = True
+                    traducciones = {}
+                    break
+                notas.append(f"idioma incorrecto → reintento {intento}/{reintentos}")
+                await asyncio.sleep(0.5)
+            except (json.JSONDecodeError, KeyError) as e:
+                intento += 1
+                if intento > reintentos:
+                    notas.append(f"⚠️  formato inválido ({type(e).__name__}), uso originales")
+                    break
+                notas.append(f"formato inválido → reintento {intento}/{reintentos}")
+                await asyncio.sleep(0.8 * intento)
+            except Exception as e:
+                intento += 1
+                if intento > reintentos:
+                    notas.append(f"⚠️  error: {type(e).__name__}: {e}")
+                    break
+                notas.append(f"{type(e).__name__} → reintento {intento}/{reintentos}")
+                await asyncio.sleep(1.5 * intento)
+
+        # Aplicar traducciones; los que falten conservan el texto original
+        mejorados_chunk: list[Subtitulo] = []
+        ok = 0
+        for s in chunk:
+            nuevo_texto = traducciones.get(s.indice)
+            if nuevo_texto:
+                ok += 1
+                mejorados_chunk.append(
+                    Subtitulo(s.indice, s.inicio, s.fin, nuevo_texto)
+                )
+            else:
+                mejorados_chunk.append(s)
+        fallidos = len(chunk) - ok
+
+        # Logging atómico (una sola línea por chunk completado)
+        estado['completados'] += 1
+        prog = estado['completados']
+        elapsed = time.time() - estado['t0']
+        rate = prog / elapsed if elapsed > 0 else 0.0
+        eta = (total_chunks - prog) / rate if rate > 0 else 0.0
+        eta_str = f"ETA {eta:5.0f}s" if rate > 0 else "ETA  ---s"
+
+        linea = (
+            f"  [{prog:>4}/{total_chunks}] {eta_str}  "
+            f"chunk#{n_chunk:<4} ({rango})  "
+            f"{ok}/{len(chunk)}"
+            + (f"  ({fallidos} fallback)" if fallidos else "")
+        )
+        if notas:
+            linea += "  | " + " · ".join(notas)
+        print(linea, flush=True)
+
+        return n_chunk, mejorados_chunk, fallidos, idioma_malo_final
+
+
 # ---------------------- Orquestación ----------------------
 
-def mejorar_srt(
+async def mejorar_srt(
     ruta_entrada: Path,
     ruta_salida: Path,
     idioma_origen: str,
@@ -422,12 +534,15 @@ def mejorar_srt(
     host: str | None,
     max_chars_por_linea: int,
     max_lineas: int,
+    concurrencia: int,
 ) -> None:
-    print(f"📄 Entrada : {ruta_entrada}")
-    print(f"📄 Salida  : {ruta_salida}")
-    print(f"🧠 Modelo  : {modelo}")
+    print(f"📄 Entrada     : {ruta_entrada}")
+    print(f"📄 Salida      : {ruta_salida}")
+    print(f"🧠 Modelo      : {modelo}")
     print(f"🌐 {idioma_origen} → {idioma_destino} | chunk={chunk_size} "
           f"| temp={temperatura} | num_ctx={num_ctx}")
+    print(f"⚡ Concurrencia: {concurrencia} chunks en paralelo")
+    print(f"   (recuerda exportar OLLAMA_NUM_PARALLEL={concurrencia} en el servidor)")
 
     subs = parse_srt(ruta_entrada)
     if not subs:
@@ -469,95 +584,92 @@ def mejorar_srt(
         .replace("{max_chars_total}", str(max_chars_total))
     )
 
-    client = ollama.Client(host=host, timeout=timeout) if host else ollama.Client(timeout=timeout)
+    client = (
+        ollama.AsyncClient(host=host, timeout=timeout)
+        if host else ollama.AsyncClient(timeout=timeout)
+    )
 
-    # Warmup: precarga el modelo en VRAM. Usamos el MISMO num_ctx que las
-    # peticiones reales para evitar que Ollama tenga que recargar el modelo
-    # con otra configuración (eso causa el error "llama runner terminated").
+    # Warmup: precarga el modelo en VRAM usando el MISMO num_ctx que las
+    # peticiones reales para evitar recargas. Lo hacemos UNA vez antes del
+    # paralelismo, para que el primer batch encuentre el modelo ya caliente.
     print("🔥 Precargando modelo en memoria...", end="", flush=True)
     t_warm = time.time()
     try:
-        client.chat(
+        await client.chat(
             model=modelo,
             messages=[{"role": "user", "content": "ok"}],
             options={"temperature": 0.0, "num_ctx": num_ctx},
+            keep_alive="30m",
         )
         print(f" listo en {time.time() - t_warm:.1f}s")
     except Exception as e:
-        # Si falla el warmup, avisamos pero seguimos: puede que el primer chunk sí funcione.
         print(f" advertencia: {type(e).__name__}: {e}")
         print(f"   (Si persiste, prueba un modelo más pequeño: -m qwen2.5:7b)")
     print()
 
+    # Construir lista de chunks (numerados desde 1 para el log)
+    chunks = list(hacer_chunks(subs, chunk_size))
+    total_chunks = len(chunks)
+    if total_chunks == 0:
+        print("Nada que traducir.")
+        return
+
+    # Si pedimos más concurrencia que chunks, recortar
+    concurrencia_efectiva = max(1, min(concurrencia, total_chunks))
+    if concurrencia_efectiva != concurrencia:
+        print(f"ℹ️  Concurrencia reducida a {concurrencia_efectiva} "
+              f"(solo hay {total_chunks} chunks).\n")
+
+    semaforo = asyncio.Semaphore(concurrencia_efectiva)
+    estado = {'completados': 0, 't0': time.time()}
+    t_inicio = estado['t0']
+
+    print(f"🚀 Procesando {total_chunks} chunks "
+          f"(concurrencia={concurrencia_efectiva})...\n")
+
+    tareas = [
+        asyncio.create_task(
+            procesar_chunk_con_reintentos(
+                n_chunk=i + 1,
+                total_chunks=total_chunks,
+                chunk=chunk,
+                client=client,
+                modelo=modelo,
+                prompt_final=prompt_final,
+                idioma_destino=idioma_destino,
+                temperatura=temperatura,
+                num_ctx=num_ctx,
+                reintentos=reintentos,
+                semaforo=semaforo,
+                estado=estado,
+            )
+        )
+        for i, chunk in enumerate(chunks)
+    ]
+
+    try:
+        resultados = await asyncio.gather(*tareas)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Cancelar tareas pendientes con limpieza
+        for t in tareas:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tareas, return_exceptions=True)
+        raise
+
+    # IMPORTANTE: gather() preserva el orden de la lista de entrada, pero
+    # ordenamos explícitamente por n_chunk por si acaso. Esto reconstruye
+    # el SRT en el orden original aunque los chunks hayan terminado fuera de orden.
+    resultados.sort(key=lambda r: r[0])
+
     mejorados: list[Subtitulo] = []
     fallidos_total = 0
     chunks_idioma_malo = 0
-    t_inicio = time.time()
-
-    for n_chunk, chunk in enumerate(hacer_chunks(subs, chunk_size), 1):
-        rango = f"{chunk[0].indice}-{chunk[-1].indice}"
-        print(f"  ⏳ Chunk {n_chunk} ({rango})...", end="", flush=True)
-
-        traducciones: dict[int, str] = {}
-        intento = 0
-        while intento <= reintentos:
-            try:
-                # Sube ligeramente la temperatura en cada reintento para
-                # "sacar" al modelo de un patrón malo (como salir en chino).
-                temp_intento = temperatura + 0.15 * intento
-                traducciones = procesar_chunk(
-                    client=client,
-                    chunk=chunk,
-                    modelo=modelo,
-                    prompt_sistema=prompt_final,
-                    temperatura=temp_intento,
-                    num_ctx=num_ctx,
-                )
-                # Validar idioma. Si una proporción significativa sale en
-                # idioma incorrecto, forzamos reintento.
-                frac_mala = _fraccion_idioma_incorrecto(traducciones, idioma_destino)
-                if frac_mala > 0.40:
-                    raise IdiomaIncorrectoError(
-                        f"{int(frac_mala*100)}% de las líneas en idioma incorrecto"
-                    )
-                break
-            except IdiomaIncorrectoError as e:
-                intento += 1
-                if intento > reintentos:
-                    print(f" ⚠️  idioma incorrecto ({e}), uso originales", end="")
-                    chunks_idioma_malo += 1
-                    traducciones = {}  # forzar fallback
-                    break
-                print(f" idioma incorrecto, reintento {intento}/{reintentos}...",
-                      end="", flush=True)
-                time.sleep(0.5)
-            except (json.JSONDecodeError, KeyError) as e:
-                intento += 1
-                if intento > reintentos:
-                    print(f" ⚠️  formato inválido ({type(e).__name__}), uso originales", end="")
-                    break
-                print(f" reintento {intento}/{reintentos}...", end="", flush=True)
-                time.sleep(0.8 * intento)
-            except Exception as e:
-                intento += 1
-                if intento > reintentos:
-                    print(f" ⚠️  error: {type(e).__name__}: {e}", end="")
-                    break
-                print(f" reintento {intento}/{reintentos}...", end="", flush=True)
-                time.sleep(1.5 * intento)
-
-        # Aplicar traducciones; los que falten conservan el texto original
-        ok = 0
-        for s in chunk:
-            nuevo_texto = traducciones.get(s.indice)
-            if nuevo_texto:
-                ok += 1
-                mejorados.append(Subtitulo(s.indice, s.inicio, s.fin, nuevo_texto))
-            else:
-                mejorados.append(s)  # fallback al original
-        fallidos = len(chunk) - ok
+    for _, chunk_subs, fallidos, idioma_malo in resultados:
+        mejorados.extend(chunk_subs)
         fallidos_total += fallidos
-        print(f" ✓ {ok}/{len(chunk)}" + (f" ({fallidos} fallback)" if fallidos else ""))
+        if idioma_malo:
+            chunks_idioma_malo += 1
 
     # Post-procesado: envolver / dividir líneas que excedan el límite visual
     mejorados_final, n_envueltos, n_divididos = aplicar_post_procesado(
@@ -566,14 +678,15 @@ def mejorar_srt(
         max_lines=max_lineas,
     )
     if n_envueltos or n_divididos:
-        print(f"✂️  Post-procesado: {n_envueltos} envueltas en 2 líneas, "
+        print(f"\n✂️  Post-procesado: {n_envueltos} envueltas en 2 líneas, "
               f"{n_divididos} divididas en varios subtítulos.")
         if len(mejorados_final) != len(mejorados):
             print(f"   ({len(mejorados)} → {len(mejorados_final)} entradas tras dividir)")
 
     write_srt(ruta_salida, mejorados_final)
     dur = time.time() - t_inicio
-    print(f"\n✅ Listo en {dur:.1f}s")
+    chunks_por_seg = total_chunks / dur if dur > 0 else 0.0
+    print(f"\n✅ Listo en {dur:.1f}s ({chunks_por_seg:.2f} chunks/s)")
     if fallidos_total:
         print(f"⚠️  {fallidos_total} líneas usaron el texto original (fallback).")
     if chunks_idioma_malo:
@@ -614,7 +727,7 @@ def construir_ruta_salida(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Traduce y mejora un archivo .srt usando Ollama.",
+        description="Traduce y mejora un archivo .srt usando Ollama (async, batches paralelos).",
     )
     p.add_argument("srt", help="Ruta al archivo .srt de entrada.")
     p.add_argument(
@@ -632,10 +745,13 @@ def parse_args() -> argparse.Namespace:
                    help="Archivo de texto con un prompt de sistema personalizado. "
                         "Puede contener {idioma_origen} y {idioma_destino}.")
     p.add_argument("--chunk", type=int, default=15,
-                   help="Líneas por bloque enviado al modelo. Default: 15. "
-                        "Bájalo si ves timeouts; súbelo si quieres más velocidad.")
+                   help="Líneas por bloque enviado al modelo. Default: 15.")
+    p.add_argument("--concurrencia", "-j", type=int, default=8,
+                   help="Número de chunks enviados a Ollama EN PARALELO. "
+                        "Default: 8 (sweet spot para RTX 6000 Ada + 12B-Q4). "
+                        "Debe ser ≤ OLLAMA_NUM_PARALLEL del servidor.")
     p.add_argument("--temperatura", type=float, default=0.5,
-                   help="Temperatura del modelo. Default: 0.3 (más fiel).")
+                   help="Temperatura del modelo. Default: 0.5.")
     p.add_argument("--num-ctx", type=int, default=16384,
                    help="Tamaño de contexto. Default: 16384.")
     p.add_argument("--timeout", type=float, default=600.0,
@@ -646,16 +762,15 @@ def parse_args() -> argparse.Namespace:
                    help="URL del servidor de Ollama (ej. http://localhost:11434). "
                         "Por defecto se usa el del cliente.")
     p.add_argument("--max-chars-por-linea", type=int, default=50,
-                   help="Máximo de caracteres por línea visible. Default: 42 "
-                        "(estándar de subtitulado). Usa 0 para desactivar el ajuste.")
+                   help="Máximo de caracteres por línea visible. Default: 50. "
+                        "Usa 0 para desactivar el ajuste.")
     p.add_argument("--max-lineas", type=int, default=2,
                    help="Máximo de líneas por subtítulo antes de dividir en varios. "
                         "Default: 2.")
     return p.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
+async def _amain(args: argparse.Namespace) -> int:
     ruta_in = Path(args.srt).expanduser().resolve()
     if not ruta_in.exists():
         print(f"❌ No existe el archivo: {ruta_in}", file=sys.stderr)
@@ -673,7 +788,7 @@ def main() -> int:
     prompt = cargar_prompt(args)
 
     try:
-        mejorar_srt(
+        await mejorar_srt(
             ruta_entrada=ruta_in,
             ruta_salida=ruta_out,
             idioma_origen=args.idioma_origen,
@@ -688,6 +803,7 @@ def main() -> int:
             host=args.host,
             max_chars_por_linea=args.max_chars_por_linea,
             max_lineas=args.max_lineas,
+            concurrencia=args.concurrencia,
         )
     except FileNotFoundError as e:
         print(f"❌ Archivo no encontrado: {e}", file=sys.stderr)
@@ -699,6 +815,15 @@ def main() -> int:
         print(f"❌ Error inesperado: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        return asyncio.run(_amain(args))
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrumpido por el usuario.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
