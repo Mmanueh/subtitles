@@ -17,7 +17,7 @@ RUN curl -L https://ollama.com/download/ollama-linux-amd64 -o /usr/bin/ollama \
 WORKDIR /app
 
 COPY requirements-runpod.txt .
-RUN pip3 install --break-system-packages -r requirements-runpod.txt
+RUN pip3 install -r requirements-runpod.txt
 
 COPY mejorar_subtitulos.py .
 COPY runpod_handler.py .
