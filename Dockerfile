@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://ollama.com/install.sh | sh
+RUN curl -L https://ollama.com/download/ollama-linux-amd64 -o /usr/bin/ollama \
+    && chmod +x /usr/bin/ollama
 
 WORKDIR /app
 
